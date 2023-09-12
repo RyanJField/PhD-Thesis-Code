@@ -1,0 +1,40 @@
+.main-heading {
+    background: #B30C00;
+    color: white;
+    padding: 15px;
+}
+
+.nav>li>a {
+    color: #B30C00;
+}
+
+.nav-tabs>li>a {
+    margin-right: 2px;
+    line-height: 1.42857143;
+    border: 1px solid transparent;
+    border-radius: 4px 4px 0 0;
+}
+
+.nav-tabs>li.active>a,
+.nav-tabs>li.active>a:focus,
+.nav-tabs>li.active>a:hover,
+.nav-tabs>li.active>a.active
+{
+    border: 1px solid #FFF;
+    border-bottom: 1px solid transparent;
+    border-top: 1px solid #FFF;
+}
+
+.nav-tabs {
+    border-bottom: 1px solid #B30C00;
+}
+
+.col-sm-8 {
+    padding: 0;
+}
+
+.nav-tabs>li.active>a, .nav-tabs>li.active>a:focus, .nav-tabs>li.active>a:hover {
+    color: #FFF;
+    cursor: default;
+    background-color: #B30C00;
+}

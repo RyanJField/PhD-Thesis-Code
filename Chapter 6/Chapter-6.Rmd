@@ -1,0 +1,1175 @@
+---
+title: "MV 2023"
+output: html_document
+date: "2023-03-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+knitr::opts_knit$set(root.dir = '/Users/ryanfield/Downloads/Paradigm')
+##################################################################
+##                        Load Libraries:                       ##
+##                     rio: for data import                     ##
+##           tidyverse: for data cleaning / wrangling           ##A
+##               lubridate: for date manipulation               ##
+##                     JM: for joint models                     ##
+##           conflicted: to resolve package conflicts           ##
+##################################################################
+
+#############################
+library(rio)
+library(tidyverse)
+library(lubridate)
+library(conflicted)
+library(mice)
+library(survAUC)
+
+########################################################################
+##  Prefer functions from dplyr over JM for easier data manipulation  ##
+########################################################################
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("lag", "dplyr")
+
+```
+
+```{r import-data}
+eGFR_baseline <- import("r-scripts-ryan/Final-Analysis/ALL-eGFR/Data/baseline.Rds")
+
+#########################################################################################
+##  Import Biomarkers from abio.dta dataset and filter (eGFR) ##
+#########################################################################################
+
+eGFR <- import("STATA/CLCZ696B_CLCZ696B2314_glasgow_analysis_datasets_M8_25Sep2014/a_lrs.dta")
+
+eGFR <- eGFR %>% filter(PARNAM1C == "EGFRSA")
+
+eGFR <- eGFR %>% select(sid1a = SID1A,
+                                eGFR_value = LABRSL1N,
+                                sample_date = SMPCOL1D,
+                                visit = VISNAM1A)
+
+eGFR <- eGFR %>% left_join(select(eGFR_baseline, sid1a, trt_drug, randate, age, sex, bmi, atrial_fibrillation, ischemic_hf, NYHA_class, sbp, diabetes), by="sid1a")
+
+#################################################################
+##                        Log eGFR.                            ##
+##  and filter any patients who did not undergo randomisation  ##
+#################################################################
+eGFR <- eGFR %>% mutate(logeGFR = log(eGFR_value)) %>%
+  filter(!is.na(randate)) 
+
+#######################################################################
+##  Calculate Months Since Randomisation using 28 day calendar month ##
+#######################################################################
+eGFR <- eGFR %>% 
+  mutate(sample_date_formatted = as_date(sample_date, format = "%d%b%Y")) %>%
+  mutate(sample_days = interval(randate, sample_date_formatted) %/% days(1)) %>% mutate(sample_month = sample_days / 28)
+
+# Remove Duplicate Values
+eGFR <- eGFR %>% mutate(sample_month = if_else(visit == "Period 2 - month 0" & sample_month != 0, 0, sample_month))
+
+##################################################################
+##        filter any observations prior to randomisation        ##
+##################################################################
+eGFR <- eGFR %>% filter(sample_month >= 0)
+
+# Arrange Data
+eGFR <- eGFR %>% arrange(sid1a) %>% group_by(sid1a) %>% arrange(sample_days, .by_group = TRUE)
+
+# Filter patients from each dataset who have been removed from either
+eGFR_baseline <- eGFR_baseline %>% filter(sid1a %in% eGFR$sid1a)
+
+# View Missing Data
+missing_data <- eGFR[!complete.cases(eGFR),]
+
+# Order Data
+eGFR <- eGFR[order(eGFR$sid1a),]
+row.names(eGFR) <- 1:nrow(eGFR)
+
+# Select Required Columns
+eGFR <- eGFR %>% select(sid1a,
+                        logeGFR,
+                        sample_month,
+                        trt_drug,
+                        visit,
+                        age,
+                        sex,
+                        atrial_fibrillation,
+                        sbp,
+                        NYHA_class,
+                        diabetes
+                        )
+
+# Filter patients from each dataset who have been removed from either
+eGFR <- eGFR %>% filter(sid1a %in% eGFR_baseline$sid1a)
+eGFR_baseline <- eGFR_baseline %>% filter(sid1a %in% eGFR$sid1a)
+
+# Select Required Columns
+eGFR_baseline <- eGFR_baseline %>% select(sid1a,
+                                          age,
+                                          region,
+                                          sex,
+                                          bmi,
+                                          ejf,
+                                          diabetes,
+                                          atrial_fibrillation,
+                                          prior_hf,
+                                          prior_mi,
+                                          prior_stroke,
+                                          ischemic_hf,
+                                          sbp,
+                                          heart_rate,
+                                          trt_drug,
+                                          NYHA_class,
+                                          composite_month,
+                                          composite_status)
+
+
+
+```
+
+
+```{r nt-probnp}
+# Import Baseline for NT-ProBNP
+ntprobnp_baseline <- import("r-scripts-ryan/Final-Analysis/ALL-NT-PROBNP/Data/baseline.Rds")
+
+# Select Required Columns
+ntprobnp_baseline <- ntprobnp_baseline %>% select(sid1a,
+                                                  age,
+                                                  region,
+                                                  sex,
+                                                  bmi,
+                                                  ejf,
+                                                  diabetes,
+                                                  atrial_fibrillation,
+                                                  prior_hf,
+                                                  prior_mi,
+                                                  prior_stroke,
+                                                  ischemic_hf,
+                                                  sbp,
+                                                  heart_rate,
+                                                  trt_drug,
+                                                  NYHA_class,
+                                                  composite_month,
+                                                  composite_status)
+
+# Import NT-ProBNP Values
+ntprobnp <- import("r-scripts-ryan/Final-Analysis/ALL-NT-PROBNP/Data/ntprobnp.Rds")
+
+# Select Required Columns and move Screening Values to Randomisation
+ntprobnp <- ntprobnp %>% select(sid1a,
+                                logNTProBNP,
+                                sample_month,
+                                visit,
+                                trt_drug,
+                                age,
+                                atrial_fibrillation,
+                                bmi
+                                ) %>%
+  mutate(visit = if_else(visit == "Screening", "Period 2 - month 0", visit))
+
+# Join the Baselines
+baseline <- full_join(eGFR_baseline, ntprobnp_baseline, by = c(
+                                                  "sid1a",
+                                                  "age",
+                                                  "region",
+                                                  "sex",
+                                                  "bmi",
+                                                  "ejf",
+                                                  "diabetes",
+                                                  "atrial_fibrillation",
+                                                  "prior_hf",
+                                                  "prior_mi",
+                                                  "prior_stroke",
+                                                  "ischemic_hf",
+                                                  "sbp",
+                                                  "heart_rate",
+                                                  "trt_drug",
+                                                  "NYHA_class",
+                                                  "composite_month",
+                                                  "composite_status"
+))
+
+# Filter patients from each dataset who have been removed from either
+baseline <- baseline %>% filter(sid1a %in% eGFR$sid1a)
+baseline <- baseline %>% filter(sid1a %in% ntprobnp$sid1a)
+
+# Filter patients from each dataset who have been removed from either
+eGFR <- eGFR %>% filter(sid1a %in% baseline$sid1a)
+ntprobnp <- ntprobnp %>% filter(sid1a %in% baseline$sid1a)
+
+# Create new dataset with both Biomarked
+biomarkers <- ntprobnp %>% full_join(eGFR, by = c("sid1a", 
+                                                  "visit", 
+                                                  "trt_drug",
+                                                  "age", 
+                                                  "atrial_fibrillation"
+                                                  ))
+
+# Keep one sample month
+biomarkers <- biomarkers %>% mutate(sample_month = if_else(sample_month.x == sample_month.y, sample_month.x, sample_month.y))
+
+# Remove Missing Biomarkers
+biomarkers <- biomarkers %>% filter(!is.na(logeGFR))
+biomarkers <- biomarkers %>% filter(!is.na(logNTProBNP))
+
+# Filter patients from each dataset who have been removed from either
+biomarkers <- biomarkers %>% filter(sid1a %in% baseline$sid1a)
+baseline <- baseline %>% filter(sid1a %in% biomarkers$sid1a)
+
+```
+
+# Spaghetti Plots
+```{r spaghetti-plots, fig.dim = c(20, 20), warning=FALSE}
+# Set seed
+set.seed(1234, "Mersenne-Twister", sample.kind = "Rejection")
+
+# Arrange the data and add number of observations
+biomarkers <- biomarkers %>% group_by(sid1a) %>% arrange(sample_month, .by_group = TRUE) %>% mutate(n_obs = n())
+export(biomarkers, "r-scripts-ryan/Final-Analysis/ALL-MV/Data/biomarkers.Rds")
+
+##################################################################
+##                   Stratified Randomisation                   ##
+##                         and sampling                         ##
+##################################################################
+biomarkers_1 <- biomarkers %>% filter(n_obs == 1)
+biomarkers_2 <- biomarkers %>% filter(n_obs == 2)
+biomarkers_3 <- biomarkers %>% filter(n_obs >= 3)
+
+u_ids_1 <- biomarkers_1[!duplicated(biomarkers_1$sid1a),]
+u_ids_2 <- biomarkers_2[!duplicated(biomarkers_2$sid1a),]
+u_ids_3 <- biomarkers_3[!duplicated(biomarkers_3$sid1a),]
+
+u_ids_1.Enalapril <- u_ids_1 %>% filter(trt_drug == "Enalapril")
+u_ids_2.Enalapril <- u_ids_2 %>% filter(trt_drug == "Enalapril")
+u_ids_3.Enalapril <- u_ids_3 %>% filter(trt_drug == "Enalapril")
+
+u_ids_1.LCZ <- u_ids_1 %>% filter(trt_drug == "LCZ")
+u_ids_2.LCZ <- u_ids_2 %>% filter(trt_drug == "LCZ")
+u_ids_3.LCZ <- u_ids_3 %>% filter(trt_drug == "LCZ")
+
+u_ids_sample_1.Enalapril <- sample(u_ids_1.Enalapril$sid1a, 3)
+u_ids_sample_2.Enalapril <- sample(u_ids_2.Enalapril$sid1a, 6)
+u_ids_sample_3.Enalapril <- sample(u_ids_3.Enalapril$sid1a, 12)
+
+u_ids_sample_1.LCZ <- sample(u_ids_1.LCZ$sid1a, 3)
+u_ids_sample_2.LCZ <- sample(u_ids_2.LCZ$sid1a, 6)
+u_ids_sample_3.LCZ <- sample(u_ids_3.LCZ$sid1a, 12)
+
+u_ids_sample <- c(u_ids_sample_1.Enalapril, u_ids_sample_2.Enalapril, u_ids_sample_3.Enalapril,
+                  u_ids_sample_1.LCZ, u_ids_sample_2.LCZ, u_ids_sample_3.LCZ)
+
+biomarkers_sample <- biomarkers %>% filter(sid1a %in% u_ids_sample) %>% group_by(sid1a)
+
+# Plot the randomly stratified patients (NT-ProBNP)
+splot <- ggplot(data = biomarkers_sample, aes(x = sample_month, y = logNTProBNP, color = trt_drug)) + geom_point() + geom_line() + facet_wrap(~sid1a) +
+  xlab("Time (Months)") +
+  ylab("(Log) NTProBNP") +
+  ggtitle("Longitudinal Profiles of (Log) NTProBNP for 42 Sampled Patients") + 
+  labs(colour = "Treatment Group")
+
+splot
+
+# Plot the randomly stratified patients (eGFR)
+splot <- ggplot(data = biomarkers_sample, aes(x = sample_month, y = logeGFR, color = trt_drug)) + geom_point() + geom_line() + facet_wrap(~sid1a) +
+  xlab("Time (Months)") +
+  ylab("(Log) eGFR") +
+  ggtitle("Longitudinal Profiles of (Log) eGFR for 42 Sampled Patients") + 
+  labs(colour = "Treatment Group")
+
+splot
+
+```
+
+
+# Fit LME
+```{r lme}
+library(JMbayes2)
+
+#################################################################
+##                           Fit LME                           ##
+#################################################################
+
+sample_month_quantiles <- quantile(ntprobnp$sample_month, probs = c(0, 0.05, 0.95, 1))
+sample_month_quantiles
+
+lme.egfr <- lme(logeGFR ~ ns(sample_month, 3, B = c(1, 17.25)) + trt_drug:ns(sample_month, 3, B = c(1, 17.25)) + age + sex + atrial_fibrillation + sbp + NYHA_class + diabetes, 
+             random = ~ ns(sample_month, 3, B = c(1, 17.25)) | sid1a, 
+             data = biomarkers,
+             control = lmeControl(opt = 'optim'), method = "ML")
+
+ntprobnp.1 <- ntprobnp %>% group_by(sid1a) %>% arrange(sample_month, .by_group = TRUE) %>% mutate(n_obs = n()) %>% filter(n_obs > 1) 
+
+sample_month_quantiles <- quantile(ntprobnp.1$sample_month, probs = c(0, 0.05, 0.95, 1))
+sample_month_quantiles
+
+lme.ntprobnp <- lme(logNTProBNP ~ 
+               ns(sample_month, df = 3, Boundary.knots = c(1, 8.857143)) * trt_drug +
+                age +
+                atrial_fibrillation +
+                bmi,
+           random = ~ ns(sample_month, df = 3, Boundary.knots = c(1, 8.857143)) | sid1a,
+           data = biomarkers,
+           control = lmeControl(opt = 'optim'), method = "ML")
+
+```
+
+# Baseline Characteristics
+```{r baseline-stats-q1-q3}
+
+library(table1)
+
+table1(~
+  age +
+  sex +
+  region +
+  bmi + 
+  ejf +
+  NYHA_class +
+  diabetes + 
+  sbp +
+  heart_rate +
+  atrial_fibrillation +
+  ischemic_hf +
+  prior_hf +
+  prior_mi + 
+  prior_stroke | trt_drug,
+  data = baseline,
+  render.continuous=c(.="Median [Q1, Q3]" ))
+
+```
+
+# Baseline Biomarkers
+```{r nt-probnp-0-q1-q3}
+biomarkers_at_baseline <- biomarkers %>% group_by(sid1a) %>% arrange(sid1a, sample_month, .by_group = T) %>% filter(row_number()==1)
+
+table1(~ exp(logNTProBNP) + exp(logeGFR) | trt_drug,
+  data = biomarkers_at_baseline,
+  render.continuous=c(.="Median [Q1, Q3]" ))
+
+```
+
+# Baseline Correlation Plot
+```{r baseline-correlation}
+
+# Calculate Scale for axis
+minLogeGFR = min(exp(biomarkers_at_baseline$logeGFR))
+maxLogeGFR = max(exp(biomarkers_at_baseline$logeGFR))
+minLogNTProBNP = min(exp(biomarkers_at_baseline$logNTProBNP))
+maxLogNTProBNP = max(exp(biomarkers_at_baseline$logNTProBNP))
+
+# Plot NT-ProBNP vs eGFR with loess curve
+ggplot(biomarkers_at_baseline, aes(x = exp(logNTProBNP), y = exp(logeGFR), colour = trt_drug)) +
+  geom_point(shape = 5) +
+  scale_x_continuous(breaks=seq(minLogNTProBNP,maxLogNTProBNP,10000)) +
+  scale_y_continuous(breaks=seq(minLogeGFR,maxLogeGFR,50)) +
+  labs(colour = "Treatment", x = "NT-ProBNP", y = "eGFR") + 
+  stat_smooth(method = "loess", se = F)
+
+cor(exp(biomarkers_at_baseline$logNTProBNP), exp(biomarkers_at_baseline$logeGFR))
+  
+```
+
+# Fit the CoxPH Model
+```{r, coxphcomp}
+library(JMbayes2)
+coxPH.comp.fit <- coxph(Surv(composite_month, composite_status) ~
+                     trt_drug +
+                     age +
+                     sex +
+                     region +
+                     bmi + 
+                     ejf +
+                     NYHA_class +
+                     diabetes + 
+                     sbp +
+                     heart_rate +
+                     atrial_fibrillation +
+                     ischemic_hf +
+                     prior_hf +
+                     prior_mi + 
+                     prior_stroke,
+                   data = baseline,
+                   x = TRUE)
+
+export(coxPH.comp.fit, "r-scripts-ryan/Final-Analysis/ALL-MV/Data/coxPH.comp.fit.Rds")
+
+```
+
+# Fit the Joint Modle
+```{r mv-jm}
+
+# Specify functional forms (alpha parameterisations)
+fun_forms <- list("logNTProBNP" = ~ value(logNTProBNP) + slope(logNTProBNP),
+                  "logeGFR" = ~ value(logeGFR) + slope(logeGFR))
+
+jm.1 <- jm(coxPH.comp.fit, list(lme.ntprobnp, lme.egfr), time_var = "sample_month",
+                n_iter = 24000L, n_burnin = 4000L, n_thin = 5L, functional_forms = fun_forms)
+
+summary(jm.1)
+
+export(jm.1, "r-scripts-ryan/Final-Analysis/ALL-MV/Data/jm.1.Rds")
+```
+
+# Longitudinal Outcomes from Joint Model
+```{r longitudinal-outcomes}
+library(kableExtra)
+
+jm1.long.1 <- as.data.frame(summary(jm.1)$Outcome1) %>% rownames_to_column()
+jm1.long.2 <- as.data.frame(summary(jm.1)$Outcome2) %>% rownames_to_column()
+
+kable(jm1.long.1, caption = "NT-ProBNP")
+kable(jm1.long.2, caption = "eGFR")
+```
+
+```{r survival-data-set}
+
+# Join the biomarkers with all baselineline characteristics
+survivalBiomarkers <- biomarkers %>% left_join(baseline, by = c(
+  "sid1a",
+  "trt_drug",
+  "age",
+  "atrial_fibrillation",
+  "bmi",
+  "sex",
+  'sbp',
+  'NYHA_class',
+  'diabetes'
+))
+
+```
+
+# Setup Data for Avarage Trajectories
+```{r setup-average-trajectories}
+
+avg_biomarker.lcz <- ntprobnp %>% filter(trt_drug == 'LCZ')
+avg_biomarker.lcz <- median(avg_biomarker.lcz$logNTProBNP)
+
+avg_biomarker.enalapril <- ntprobnp %>% filter(trt_drug == 'Enalapril')
+avg_biomarker.enalapril <- ntprobnp %>% filter(sample_month == 0, trt_drug == 'Enalapril')
+avg_biomarker.enalapril <- median(avg_biomarker.enalapril$logNTProBNP)
+
+##################################################################
+##         Function to return the most frequent Factors         ##
+##################################################################
+mostfrequentFactor <- function(column){
+  mff <- data.frame(table(column))
+  mff[which.max(mff$Freq),]$column
+}
+
+##################################################################
+##   Make a Dataset for the Average Patient in each treatment   ##
+##################################################################
+avg_biomarkers<- with(survivalBiomarkers,
+                              expand.grid(
+                                sid1a = 0,
+                                sample_month = 0,
+                                trt_drug = factor("LCZ", levels = levels(survivalBiomarkers$trt_drug)),
+                                age = median(age),
+                                sex = mostfrequentFactor(sex),
+                                region = mostfrequentFactor(region),
+                                bmi = median(bmi),
+                                ejf = median(ejf),
+                                sbp = median(sbp),
+                                heart_rate = median(heart_rate),
+                                NYHA_class = mostfrequentFactor(NYHA_class),
+                                diabetes = mostfrequentFactor(diabetes),
+                                atrial_fibrillation = mostfrequentFactor(atrial_fibrillation),
+                                ischemic_hf = mostfrequentFactor(ischemic_hf),
+                                prior_hf = mostfrequentFactor(prior_hf),
+                                prior_mi  = mostfrequentFactor(prior_mi),
+                                prior_stroke = mostfrequentFactor(prior_stroke),
+                                logNTProBNP = 0,
+								                logeGFR = 0
+                              ))
+
+
+avg_biomarkers_2<- with(survivalBiomarkers,
+                              expand.grid(
+                                sid1a = 1,
+                                sample_month = 0,
+                                trt_drug = factor("Enalapril", levels = levels(survivalBiomarkers$trt_drug)),
+                                age = median(age),
+                                sex = mostfrequentFactor(sex),
+                                region = mostfrequentFactor(region),
+                                bmi = median(bmi),
+                                ejf = median(ejf),
+                                sbp = median(sbp),
+                                heart_rate = median(heart_rate),
+                                NYHA_class = mostfrequentFactor(NYHA_class),
+                                diabetes = mostfrequentFactor(diabetes),
+                                atrial_fibrillation = mostfrequentFactor(atrial_fibrillation),
+                                ischemic_hf = mostfrequentFactor(ischemic_hf),
+                                prior_hf = mostfrequentFactor(prior_hf),
+                                prior_mi  = mostfrequentFactor(prior_mi),
+                                prior_stroke = mostfrequentFactor(prior_stroke),
+                                logNTProBNP = 0,
+                                logeGFR = 0
+                              ))
+
+
+library(kableExtra)
+
+```
+
+# Predicted Average Trajectories from Joint Model
+```{r Average_Trajectories}
+
+#################################################################
+##          Predict Average Values for Each Treatment          ##
+#################################################################
+l_pred.lcz <- predict(jm.1, newdata = avg_biomarkers,
+            times = seq(0, 17.25, length.out = 51),
+            type = "mean_subject",
+            return_newdata = T)
+
+l_pred.enalapril <- predict(jm.1, newdata = avg_biomarkers_2,
+            times = seq(0, 17.25, length.out = 51),
+            type = "mean_subject",
+            return_newdata = T)
+
+# Extract the predictions
+lcz <- l_pred.lcz$newdata2
+enalapril <- l_pred.enalapril$newdata2
+
+# Bind these two dataset together
+lcz_enalapril <- rbind(lcz, enalapril)
+
+# Plot the average Trajectories NT-ProBNP
+ggplot(data = biomarkers, mapping = aes(x = sample_month, y = logNTProBNP, color = trt_drug)) + 
+         geom_point(mapping = aes(group = sid1a)) + geom_line(mapping = aes(group = sid1a), alpha = 0.5) +
+  xlim(0,12) + ylim(6.25,8) + 
+  geom_ribbon(aes(ymin=low_logNTProBNP, ymax=upp_logNTProBNP), linetype=2, alpha=0.5, data = lcz_enalapril, fill = 'white') + 
+  geom_line(data = lcz_enalapril, mapping = aes(x = sample_month, y = pred_logNTProBNP, color = trt_drug), alpha = 1) + labs(color = "Treatment") + ggtitle("Average Trajectories of (Log) NTProBNP by Treatment Group") + xlab("Sample Time (Months)") + ylab("(Log) NT ProBNP")
+
+# Plot the average Trajectories eGFR
+ggplot(data = biomarkers, mapping = aes(x = sample_month, y = logeGFR, color = trt_drug)) + 
+         geom_point(mapping = aes(group = sid1a), alpha = 0.1) + geom_line(mapping = aes(group = sid1a), alpha = 0.1) +
+  xlim(0,12) + 
+  ylim(4.05,4.21) +
+  geom_ribbon(aes(ymin=low_logeGFR, ymax=upp_logeGFR), linetype=2, alpha=0.5, data = lcz_enalapril, fill = 'white') + 
+  geom_line(data = lcz_enalapril, mapping = aes(x = sample_month, y = pred_logeGFR, color = trt_drug), alpha = 1) + labs(color = "Treatment") + ggtitle("Average Trajectories of (log) eGFR by Treatment Group") + xlab("Sample Time (Months)") + ylab("(log) eGFR")
+
+```
+
+# Dynamic Predictions
+```{r dynamic-predictions}
+# Select Randomly sampled patient
+biomarkers_4 <- survivalBiomarkers %>% filter(sid1a == "3142_00004")
+
+# Set the Survival Outcome to Null
+biomarkers_4$composite_month <- NULL
+biomarkers_4$composite_status <- NULL
+
+# Function for dynamic prediction plots
+dynamic_pred <- function(newData){
+  for (i in seq_len(nrow(newData)))
+  {
+    # Predict Longitudinal Outcome
+    l_pred.4 <- predict(jm.1, newdata = newData[1:i,],
+            times = seq(0, 24, length.out = 51),
+            type = "subject_specific",
+            return_newdata = T)
+    # Predict Survival Outcome
+    s_pred.4 <- predict(jm.1, newdata = newData[1:i,],
+              times = seq(0, 24, length.out = 51),
+              process = "event",
+              return_newdata = T)
+    # Plot Longitudinal and Survival Outcomes
+    plot(l_pred.4, s_pred.4, outcomes = 1:2,
+       fun_long = exp,
+           fun_event = function (x) 1 - x,
+           ylab_event = "Survival Probability",
+           ylab_long = c("NT-ProBNP", "eGFR"),
+           CI_long = T,
+           CI_event = T,
+           ylim_long_outcome_range = F)  + title(paste0("Observation ", i))
+    # Print the Survival at 24 Months
+    print(paste0('Survival at 24 Months: ', round(1 - s_pred.4[s_pred.4$sample_month == 24, ]$pred_CIF,2)))
+    print(paste0('(',
+                 round(1 - s_pred.4[s_pred.4$sample_month == 24, ]$low_CIF,2),
+                 ' - ',
+                 round(1 - s_pred.4[s_pred.4$sample_month == 24, ]$upp_CIF,2),
+                 ')'
+                 ))
+    
+  }
+}
+
+# Call the funciton to plot the dynamic predictions
+dynamic_pred(biomarkers_4)
+
+
+```
+
+# Joint Model 1 HR's
+```{r jm1-hr}
+summary.jm <- as.data.frame(summary(jm.1)$Survival)
+summary.jm <- summary.jm %>% mutate(HR = exp(Mean))
+summary.jm <- round(summary.jm,3)
+summary.jm <- summary.jm %>%mutate(P = ifelse(P == 0, '< 0.000', P))
+summary.jm <- summary.jm %>% mutate(HR = paste0(round(exp(Mean), 2), '(', round(exp(`2.5%`),2), ' - ', round(exp(`97.5%`),2), ')'))
+kable(summary.jm) %>% kable_styling()
+```
+
+#  ROC Joint Model 1 (Time Dependant) - ROC and tvAUC, Prediction at one year using data at month 0
+```{r roc-1-12}
+
+survivalBiomarkers <- survivalBiomarkers %>%
+  group_by(sid1a) %>% arrange(sid1a, sample_month) %>% distinct(sid1a, sample_month, .keep_all = T)
+
+roc <- tvROC(jm.1, newdata = survivalBiomarkers, Tstart = 0, Dt = 12)
+roc
+plot(roc)
+tvAUC(roc)
+```
+
+#  ROC Joint Model 1 (Time Dependant) - ROC and tvAUC Prediction at month 24 (one year) using data up until month 12
+```{r roc-1-24}
+
+roc <- tvROC(jm.1, newdata = survivalBiomarkers, Tstart = 12, Dt = 12)
+roc
+plot(roc)
+tvAUC(roc)
+
+```
+
+# Calibration Plot for Joint Model 1(Time Dependant) at one year using data at month 0
+```{r calibration-plot-1-12}
+calibration_plot(jm.1, newdata = survivalBiomarkers, Tstart = 0, Dt = 12, main = "Calibration Curve for Joint Model 1 (Time Dependant) at 12 Months using Data at month 0")
+
+```
+
+# Calibration Plot for Joint Model 1 (Time Dependant) at month 24 (one year) using data up until month 12
+```{r calibration-plot-1-24}
+calibration_plot(jm.1, newdata = survivalBiomarkers, Tstart = 12, Dt = 12, main = "Calibration Curve for Joint Model 1 (Time Dependant) at month 24 using Data at month 12")
+
+```
+
+# Brier Score for Joint Model 1 (Time Dependant) at one year using data at month 0
+```{r brier-score-1-12}
+pErr.1.12 <- tvBrier(jm.1, newdata = survivalBiomarkers, Tstart = 0, Dt = 12)
+pErr.1.12
+```
+
+# Brier Score for Joint Model 1 (Time Dependant) at month 24 (one year) using data up until month 12
+```{r brier-score-1-24}
+pErr.1.24 <- tvBrier(jm.1, newdata = survivalBiomarkers, Tstart = 12, Dt = 12)
+pErr.1.24
+```
+
+# Validation - Atmosphere Import
+```{r atmosphere-import}
+
+# Import Baseline data
+baseline_atmosphere  <- import("Atmosphere/Master/atmosphere master.dta")
+lrs <- import("Atmosphere/STATA1/alrs.dta")
+
+# Import Lab Results and filter eGFR
+eGFR_atmosphere <- lrs %>% filter(grepl("EGFRSA", PARNAM1C))
+
+# Import Lab Results
+lrb <- import("Atmosphere/STATA1/lrb.dta")
+
+# Filter Natriuretic Peptides
+NatriureticPeptides <- lrb %>% filter(grepl("BNP", PARNAM1C))
+
+# Filter NT-ProBNP
+ntprobnp_atmosphere <- NatriureticPeptides %>% filter(PARNAM1C == "NTBNP")
+# Select Required Columns
+ntprobnp_atmosphere <- ntprobnp_atmosphere %>% select(sid1a = SID1A,
+                                ntprobnp_value = LABRSL1N,
+                                sample_date = SMPCOL1O,
+                                visit = VISNAM1A)
+
+NatriureticPeptides <- NULL
+
+lrb <- NULL
+lrs <- NULL
+
+```
+
+# Validation - Atmosphere Tidy
+```{r atmospher-tidy}
+# Select appropriate columns
+eGFR_atmosphere <- eGFR_atmosphere %>% select(sid1a = SID1A,
+               eGFR_value = LABRSL1N,
+               sample_date = SMPCOL1D,
+               visit = VISNAM1A)
+# Select appropriate columns
+baseline_atmosphere <- baseline_atmosphere %>% select(sid1a = sid1a,
+                                randate =tstt_1o,
+                                t2dth,
+                                t2cnpt,
+                                t2hhf,
+                                c4dth,
+                                c4cnpt,
+                                c4hhf,
+                                age = age_1n,
+                                region,
+                                sex = sex1c,
+                                trt = trtr,
+                                bmi = bmibl1n,
+                                NYHA = nyhcls2c,
+                                ejf = lvefsc1n,
+                                diabetes = dbt3c,
+                                atrial_fibrillation = af_flg1,
+                                prior_hf = phh_flg1,
+                                prior_mi = priormi,
+                                prior_stroke = stroke_flg1,
+                                ischemic_hf = isc_flg1,
+                                sbp = sbpbl1n,
+                                heart_rate = plsbl1n
+)
+
+md.pattern(baseline_atmosphere)
+
+```
+
+```{r atmosphere-data-cleaning}
+
+# Recode for use with Paradigmn
+baseline_atmosphere <- baseline_atmosphere %>% mutate(trt_drug = as.factor(case_when(
+  trt == "A" ~ "LCZ",
+  trt == "B" ~ "LCZ",
+  trt == "C" ~ "Enalapril"
+)))
+
+# Recode Region to factor
+baseline_atmosphere <- baseline_atmosphere %>% mutate(region = as.factor(case_when(
+  region == 1 ~ "North American",
+  region == 2 ~ "Latin America",
+  region == 3 ~ "Western Europe",
+  region == 4 ~ "Central Europe",
+  region == 5 ~ "Pacific Asia/Pacific and Other"
+)))
+
+# Recode NYHA Class to factor
+baseline_atmosphere <- baseline_atmosphere %>% mutate(NYHA_class = as.factor(case_when(
+  NYHA == "1" ~ "CLASS_1",
+  NYHA == "2" ~ "CLASS_2",
+  NYHA == "3" ~ "CLASS_3",
+  NYHA == "4" ~ "CLASS_4"
+)))
+
+# Recode Sex as Factor
+baseline_atmosphere <- baseline_atmosphere %>% mutate(sex = as.factor(
+  if_else(sex == 1, "MALE", "FEMALE")))
+
+# Recode diabetes as Factor
+baseline_atmosphere <- baseline_atmosphere %>% mutate(diabetes = as.factor(
+  if_else(diabetes == 1, "TRUE", "FALSE")))
+
+# Recode AF as Factor
+baseline_atmosphere <- baseline_atmosphere %>% mutate(atrial_fibrillation = as.factor(
+  if_else(atrial_fibrillation == 1, "TRUE", "FALSE")))
+
+# Recode Prior Hospitalisation for Heart Failure as Factor
+baseline_atmosphere <- baseline_atmosphere %>% mutate(prior_hf = as.factor(
+  if_else(prior_hf == 1, "TRUE", "FALSE")))
+
+# Recode Prior MI as Factor
+baseline_atmosphere <- baseline_atmosphere %>% mutate(prior_mi = as.factor(
+  if_else(prior_mi == 1, "TRUE", "FALSE")))
+
+# Recode Prior Stroke as Factor
+baseline_atmosphere <- baseline_atmosphere %>% mutate(prior_stroke = as.factor(
+  if_else(prior_stroke == 1, "TRUE", "FALSE")))
+
+# Recode Time to Composite Event to 28 Calendar Day Months
+baseline_atmosphere<- baseline_atmosphere%>% mutate(composite_month = t2cnpt / 28)
+
+# Invert Censor For Composite Event to be 1 for Event
+baseline_atmosphere<- baseline_atmosphere%>% mutate(composite_status = if_else(c4cnpt == 1, 0, 1))
+
+# Recode Ischemic HF to Factor
+baseline_atmosphere <- baseline_atmosphere %>% mutate(ischemic_hf = as.factor(if_else(ischemic_hf == 1, "YES", "NO")))
+
+# Remove Missing for Ischemic HF
+baseline_atmosphere <- baseline_atmosphere %>% filter(!is.na(ischemic_hf))
+
+# Join Baseline Characteristics with eGFR Values
+eGFR_atmosphere <- eGFR_atmosphere %>% left_join(select(baseline_atmosphere, sid1a, trt_drug, randate, age, sex, bmi, atrial_fibrillation, ischemic_hf, NYHA_class, sbp, diabetes), by="sid1a")
+
+#################################################################
+##                        Log eGFR                         ##
+##  and filter any patients who did not undergo randomisation  ##
+#################################################################
+eGFR_atmosphere <- eGFR_atmosphere %>% mutate(logeGFR = log(eGFR_value)) %>% filter(!is.na(randate)) 
+
+#######################################################################
+##  Calculate Months Since Randomisation using 28 day calendar month  ##
+#######################################################################
+eGFR_atmosphere <- eGFR_atmosphere %>% 
+  mutate(sample_date_formatted = as_date(sample_date, format = "%d%b%Y")) %>%
+  mutate(sample_days = interval(randate, sample_date_formatted) %/% days(1)) %>% mutate(sample_month = sample_days / 28)
+
+eGFR_atmosphere <- eGFR_atmosphere %>% mutate(sample_month = if_else(visit == "Period 2 - month 0" & sample_month != 0, 0, sample_month))
+
+##################################################################
+##        filter any observations prior to randomisation        ##
+##################################################################
+
+# Arrange Data
+eGFR_atmosphere <- eGFR_atmosphere %>% arrange(sid1a) %>% group_by(sid1a) %>% arrange(sample_days, .by_group = TRUE)
+
+# View Missing Data
+missing_data_eGFR <- eGFR_atmosphere[!complete.cases(eGFR_atmosphere),]
+
+# Filter Missing eGFR Values
+eGFR_atmosphere <- eGFR_atmosphere %>% filter(!is.na(eGFR_value))
+
+# Filter removed patients from baseline
+baseline_atmosphere <- baseline_atmosphere %>% filter(sid1a %in% eGFR_atmosphere$sid1a)
+
+missing_data <- eGFR_atmosphere[!complete.cases(eGFR_atmosphere),]
+
+# Filter Patients with Missing NYHA Class
+baseline_atmosphere <- baseline_atmosphere %>% filter(!is.na(NYHA_class)) %>%
+  filter(!is.na(bmi))
+
+# Sort Two Datasets to same order
+eGFR_atmosphere <- eGFR_atmosphere[order(eGFR_atmosphere$sid1a),]
+row.names(eGFR_atmosphere) <- 1:nrow(eGFR_atmosphere)
+baseline_atmosphere <- baseline_atmosphere[order(baseline_atmosphere$sid1a),]
+row.names(baseline_atmosphere) <- 1:nrow(baseline_atmosphere)
+
+# Filter Any Patients Removed from Either Dataset
+eGFR_atmosphere <- eGFR_atmosphere %>% filter(sid1a %in% baseline_atmosphere$sid1a)
+baseline_atmosphere <- baseline_atmosphere %>% filter(sid1a %in% eGFR_atmosphere$sid1a)
+
+```
+
+```{r nt-probnp-atmosphere}
+ntprobnp_atmosphere <- ntprobnp_atmosphere %>% left_join(select(baseline_atmosphere, sid1a, trt_drug, randate, age, sex, bmi, atrial_fibrillation, ischemic_hf, composite_month, composite_status, region, ejf, heart_rate, prior_hf, prior_mi, prior_stroke), by="sid1a")
+
+#################################################################
+##                        Log ntprobnp                         ##
+##  and filter any patients who did not undergo randomisation  ##
+#################################################################
+ntprobnp_atmosphere <- ntprobnp_atmosphere %>% mutate(logNTProBNP = log(ntprobnp_value)) %>%
+  filter(!is.na(randate)) 
+
+#######################################################################
+##  Calculate Months Since Randomisation using 28 day calendar month  ##
+#######################################################################
+ntprobnp_atmosphere <- ntprobnp_atmosphere %>% 
+  mutate(sample_date_formatted = as_date(sample_date, format = "%d%b%Y")) %>%
+  mutate(sample_days = interval(randate, sample_date_formatted) %/% days(1)) %>% mutate(sample_month = sample_days / 28)
+
+##################################################################
+##        filter any observations prior to randomisation        ##
+##################################################################
+ntprobnp_atmosphere <- ntprobnp_atmosphere %>% filter(sample_month >= 0)
+
+# Remove missing NT-ProBNP
+ntprobnp_atmosphere <- ntprobnp_atmosphere %>% filter(!is.na(logNTProBNP))
+
+# Arrange Data
+ntprobnp_atmosphere <- ntprobnp_atmosphere %>% arrange(sid1a) %>% group_by(sid1a) %>% arrange(sample_days, .by_group = TRUE)
+
+# Sort Two Datasets to same order
+ntprobnp_atmosphere <- ntprobnp_atmosphere[order(ntprobnp_atmosphere$sid1a),]
+row.names(ntprobnp_atmosphere) <- 1:nrow(ntprobnp_atmosphere)
+baseline_atmosphere <- baseline_atmosphere[order(baseline_atmosphere$sid1a),]
+row.names(baseline_atmosphere) <- 1:nrow(baseline_atmosphere)
+
+```
+
+```{r atmosphere-merge}
+# Merge the Biomarkers
+atmosphereBiomarkers <- ntprobnp_atmosphere %>% full_join(eGFR_atmosphere, by = c("sid1a", 
+                                                  "visit", 
+                                                  "trt_drug",
+                                                  "age", 
+                                                  "atrial_fibrillation",
+                                                  "ischemic_hf",
+                                                  "sex",
+                                                  "bmi",
+                                                  "randate"
+                                                  ))
+
+# Keep only one date
+atmosphereBiomarkers <- atmosphereBiomarkers %>% mutate(sample_month = if_else(sample_month.x == sample_month.y, sample_month.x, sample_month.y))
+
+# Filter missing either biomarker
+atmosphereBiomarkers <- atmosphereBiomarkers %>% filter(!is.na(logeGFR))
+atmosphereBiomarkers <- atmosphereBiomarkers %>% filter(!is.na(logNTProBNP))
+
+# Filter Any Patients Removed from Either Dataset
+atmosphereBiomarkers <- atmosphereBiomarkers %>% filter(sid1a %in% baseline_atmosphere$sid1a)
+
+baseline_atmosphere <- baseline_atmosphere %>% filter(sid1a %in% atmosphereBiomarkers$sid1a)
+
+atmosphereSurvival <- atmosphereBiomarkers
+
+export(atmosphereSurvival, "r-scripts-ryan/Final-Analysis/ALL-MV/Data/atmospherSurvivaleGFR.rds")
+
+```
+
+# Validation ROC Joint Model 1 (Time Dependant) - ROC and tvAUC, Prediction at one year using data at month 0
+```{r roc-atmosphere-1-12}
+roc <- tvROC(jm.1, newdata = atmosphereSurvival, Tstart = 0, Dt = 12)
+roc
+plot(roc)
+tvAUC(roc)
+```
+
+# Validation ROC Joint Model 1 (Time Dependant) - ROC and tvAUC Prediction at month 24 (one year) using data up until month 12
+```{r roc-atmosphere-1-24}
+roc <- tvROC(jm.1, newdata = atmosphereSurvival, Tstart = 12, Dt = 12)
+roc
+plot(roc)
+tvAUC(roc)
+
+```
+
+# Atmosphere Validation Calibration Plot for Joint Model 1(Time Dependant) at one year using data at month 0
+```{r validation-calibration-plot-1-12}
+calibration_plot(jm.1, newdata = atmosphereSurvival, Tstart = 0, Dt = 12, main = "Calibration Curve for Joint Model 1 (Time Dependant) at 12 Months using Data at month 0")
+
+```
+
+# Atmosphere Validation Calibration Plot for Joint Model 1 (Time Dependant) at month 24 (one year) using data up until month 12
+```{r validation-calibration-plot-1-24}
+calibration_plot(jm.1, newdata = atmosphereSurvival, Tstart = 12, Dt = 12, main = "Calibration Curve for Joint Model 1 (Time Dependant) at month 24 using Data at month 12")
+
+```
+
+# Atmosphere Validation Brier Score for Joint Model 1 (Time Dependant) at one year using data at month 0
+```{r validation-brier-score-1-12}
+pErr.1.12 <- tvBrier(jm.1, newdata = atmosphereSurvival, Tstart = 0, Dt = 12)
+pErr.1.12
+```
+
+# Atmosphere Validation Brier Score for Joint Model 1 (Time Dependant) at month 24 (one year) using data up until month 12
+```{r validation-brier-score-1-24}
+pErr.1.24 <- tvBrier(jm.1, newdata = atmosphereSurvival, Tstart = 12, Dt = 12)
+pErr.1.24
+```
+
+# Clear the joint models from memory
+```{r clear-memory}
+jm.1 <- NULL
+```
+
+# Fit Last Measurement Cox PH Model
+```{r comparative-analysis-cox-last}
+biomarkers.last <- biomarkers %>% group_by(sid1a) %>% arrange(sid1a, sample_month) %>%
+  mutate(row_number = row_number()) %>% filter(row_number == n())
+
+biomarkers.last <- biomarkers.last %>% left_join(baseline, by = c(
+  "sid1a",
+  "trt_drug",
+  "age",
+  "atrial_fibrillation",
+  "bmi",
+  "sex",
+  "NYHA_class",
+  "sbp",
+  "diabetes"
+  #"eGFR",
+  #"randate",
+  #"ischemic_hf"
+))
+
+coxPH.comp.fit.last <- coxph(Surv(composite_month, composite_status) ~
+                     trt_drug +
+                     age +
+                     sex +
+                     region +
+                     bmi + 
+                     ejf +
+                     NYHA_class +
+                     diabetes + 
+                     sbp +
+                     heart_rate +
+                     atrial_fibrillation +
+                     ischemic_hf +
+                     prior_hf +
+                     prior_mi + 
+                     prior_stroke +
+                     logNTProBNP +
+					           logeGFR,
+                   data = biomarkers.last,
+                   x = TRUE)
+
+summary(coxPH.comp.fit.last)
+
+```
+
+# Last Measurement Cox PH Summary
+```{r summary-cox-ph-last}
+
+cox.last.summary <- as.data.frame(summary(coxPH.comp.fit.last)$conf.int) %>%
+  rownames_to_column() %>%
+  mutate(
+    `Pr(>|z|)` = as.data.frame(summary(coxPH.comp.fit.last)$coefficients)$`Pr(>|z|)`
+  ) %>%
+  mutate(
+    `exp(coef)` = round(`exp(coef)`, 2),
+    `lower .95` = round(`lower .95`, 2),
+    `upper .95` = round(`upper .95`, 2),
+  `p-value` = if_else(round(`Pr(>|z|)`,3) == 0, "<0.001", as.character(round(`Pr(>|z|)`,3)))) %>%
+  dplyr::select(rowname,
+  HR = `exp(coef)`,
+  `lower .95`,
+  `upper .95`,
+  `p-value`
+  ) %>% mutate(
+    HR = paste0(HR, " (", `lower .95`, "-", `upper .95`, ")")
+  )
+
+kable(cox.last.summary)
+
+```
+
+# Cox PH Last AUC 12 Month
+```{r cox-ph-last-auc-12}
+library(risksetROC)
+
+biomarkers.last.na.rm <- biomarkers.last
+biomarkers.last.na.rm$n <- 1:nrow(biomarkers.last.na.rm)
+biomarkers.last.na.rm <- biomarkers.last.na.rm %>% filter(!n %in% coxPH.comp.fit.last$na.action)
+
+surivival.time = biomarkers.last.na.rm$composite_month
+status = biomarkers.last.na.rm$composite_status
+eta = coxPH.comp.fit.last$linear.predictors
+method = "Cox"
+
+last.auc.12 <- risksetROC(Stime = surivival.time, status = status, method = method, predict.time = 12, marker = eta, weight = "conditional", xlab = '1 - Specificity', ylab = "Sensitivity")
+
+last.auc.12$AUC
+
+kable(list(AUC = last.auc.12$AUC), col.names = c("AUC"))
+
+```
+
+# Cox PH Last AUC 24 Months
+```{r cox-ph-last-auc-24}
+
+last.auc.24 <- risksetROC(Stime = surivival.time, status = status, method = method, predict.time = 24, marker = eta, weight = "conditional", xlab = '1 - Specificity', ylab = "Sensitivity")
+
+last.auc.24$AUC
+
+kable(list(AUC = last.auc.24$AUC), col.names = c("AUC"))
+
+```
+
+# Fit extended Cox PH
+```{r, comparative-analysis-extended-cox}
+
+biomarkers.extended <- biomarkers %>% group_by(sid1a) %>% left_join(baseline, by = c(
+  "sid1a",
+  "trt_drug",
+  "age",
+  "atrial_fibrillation",
+  "bmi",
+  "sex",
+  "NYHA_class",
+  "sbp",
+  "diabetes"
+)) %>% arrange(sid1a, sample_month) %>%
+  mutate(
+    comp_start = sample_month,
+    comp_stop = lead(sample_month, default = last(composite_month)),
+    comp_event = if_else(sample_month == last(sample_month), composite_status, 0)
+  )
+
+extendedCoxPH.comp.fit <- coxph(Surv(comp_start, comp_stop, comp_event) ~
+                     trt_drug +
+                     age +
+                     sex +
+                     region +
+                     bmi + 
+                     ejf +
+                     NYHA_class +
+                     diabetes + 
+                     sbp +
+                     heart_rate +
+                     atrial_fibrillation +
+                     ischemic_hf +
+                     prior_hf +
+                     prior_mi + 
+                     prior_stroke +
+                     logNTProBNP +
+					 logeGFR,
+                   data = biomarkers.extended,
+                   x = TRUE)
+
+summary(extendedCoxPH.comp.fit)
+
+```
+
+# Extented Cox PH Summary
+```{r summary-cox-ph-extended}
+
+cox.extended.summary <- as.data.frame(summary(extendedCoxPH.comp.fit)$conf.int) %>%
+  rownames_to_column() %>%
+  mutate(
+    `Pr(>|z|)` = as.data.frame(summary(extendedCoxPH.comp.fit)$coefficients)$`Pr(>|z|)`
+  ) %>%
+  mutate(
+    `exp(coef)` = round(`exp(coef)`, 2),
+    `lower .95` = round(`lower .95`, 2),
+    `upper .95` = round(`upper .95`, 2),
+  `p-value` = if_else(round(`Pr(>|z|)`,3) == 0, "<0.001", as.character(round(`Pr(>|z|)`,3)))) %>%
+  dplyr::select(rowname,
+  HR = `exp(coef)`,
+  `lower .95`,
+  `upper .95`,
+  `p-value`
+  ) %>% mutate(
+    HR = paste0(HR, " (", `lower .95`, "-", `upper .95`, ")")
+  )
+
+kable(cox.extended.summary)
+
+```
+
+# AUC Extended Cox PH, Prediction at one year
+```{r extended-auc-12}
+
+biomarkers.extended.na.rm <- biomarkers.extended
+biomarkers.extended.na.rm$n <- 1:nrow(biomarkers.extended.na.rm)
+biomarkers.extended.na.rm <- biomarkers.extended.na.rm %>% filter(!n %in% extendedCoxPH.comp.fit$na.action)
+
+surivival.time = biomarkers.extended.na.rm$comp_stop
+entry.time = biomarkers.extended.na.rm$comp_start
+status = biomarkers.extended.na.rm$comp_event
+eta = extendedCoxPH.comp.fit$linear.predictors
+method = "Cox"
+
+extended.auc.12 <- risksetROC(Stime = surivival.time, entry = entry.time, status = status, method = method, predict.time = 12, marker = eta, weight = "conditional", xlab = '1 - Specificity', ylab = "Sensitivity")
+
+extended.auc.12$AUC
+kable(list(AUC = extended.auc.12$AUC), col.names = c("AUC"))
+```
+
+# AUC Extended Cox PH Prediction at 24 months
+```{r extended-auc-24}
+extended.auc.24 <- risksetROC(Stime = surivival.time, entry = entry.time, status = status, method = method, predict.time = 24, marker = eta, weight = "conditional", xlab = '1 - Specificity', ylab = "Sensitivity")
+
+extended.auc.24$AUC
+kable(list(AUC = extended.auc.24$AUC), col.names = c("AUC"))
+```
+
+# Number of Observations
+```{r nobs}
+
+biomarkers.distinct <- biomarkers[!duplicated(biomarkers$sid1a), ]
+
+summary(as.factor(biomarkers.distinct$n_obs))
+
+biomarkers.1 <- biomarkers.distinct %>% filter(n_obs == 1)
+biomarkers.2 <- biomarkers.distinct %>% filter(n_obs == 2)
+biomarkers.3 <- biomarkers.distinct %>% filter(n_obs == 3)
+biomarkers.4 <- biomarkers.distinct %>% filter(n_obs == 4)
+
+nrow(biomarkers.1)
+nrow(biomarkers.2)
+nrow(biomarkers.3)
+nrow(biomarkers.4)
+
+```
